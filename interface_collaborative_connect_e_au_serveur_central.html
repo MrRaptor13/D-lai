@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Suivi de production – Cabinet (Centralisé & CGI Loop)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <style>
+    :root {
+      --bg: #f4f6f9; --sf: #ffffff; --tx: #18202c; --mu: #64748b; --bd: #dce2ec;
+      --ac: #1d4ed8; --ok: #15803d; --wr: #b45309; --er: #b91c1c;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f172a; --sf: #1e293b; --tx: #f1f5f9; --mu: #94a3b8; --bd: #334155;
+        --ac: #60a5fa; --ok: #4ade80; --wr: #fbbf24; --er: #f87171;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--tx); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: var(--sf); border-bottom: 1px solid var(--bd); flex-wrap: wrap; }
+    h1 { font-size: 16px; margin: 0; flex: 1; }
+    nav { display: flex; gap: 6px; padding: 8px 16px; background: var(--sf); border-bottom: 1px solid var(--bd); overflow-x: auto; }
+    main { padding: 16px; max-width: 1240px; margin: auto; }
+    button, select, input { font: inherit; color: var(--tx); background: var(--sf); border: 1px solid var(--bd); border-radius: 6px; padding: 6px 10px; }
+    button { cursor: pointer; }
+    button.pri, button.on { background: var(--ac); color: #fff; border-color: var(--ac); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--bd); }
+    .badge.ok { color: var(--ok); border-color: var(--ok); }
+    .badge.er { color: var(--er); border-color: var(--er); }
+    .card { background: var(--sf); border: 1px solid var(--bd); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .card b { display: block; font-size: 24px; }
+    .wrap { overflow-x: auto; background: var(--sf); border: 1px solid var(--bd); border-radius: 8px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 9px 12px; border-bottom: 1px solid var(--bd); text-align: left; white-space: nowrap; }
+    th { font-size: 12px; color: var(--mu); }
+    .login-box { max-width: 380px; margin: 10vh auto; background: var(--sf); border: 1px solid var(--bd); border-radius: 12px; padding: 24px; }
+    .login-box label { display: block; margin-top: 12px; font-size: 12px; color: var(--mu); }
+    .login-box input { width: 100%; margin-top: 4px; }
+    .alert { padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; border: 1px solid var(--er); color: var(--er); }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <!-- Écran d'authentification individuelle (aucune sélection libre d'identité) -->
+  <section id="login-view" class="login-box">
+    <h2 style="margin:0 0 6px;">Connexion Cabinet</h2>
+    <p style="margin:0 0 14px;color:var(--mu);font-size:13px;">Authentification individuelle requise pour accéder à la base centralisée.</p>
+    <div id="login-error" class="alert hidden"></div>
+    <form id="login-form">
+      <label>Adresse email professionnelle
+        <input type="email" id="login-email" required autocomplete="username" placeholder="prenom.nom@cabinet.fr">
+      </label>
+      <label>Mot de passe
+        <input type="password" id="login-password" required autocomplete="current-password">
+      </label>
+      <button type="submit" class="pri" style="width:100%;margin-top:16px;">Se connecter</button>
+    </form>
+  </section>
+
+  <!-- Espace de travail centralisé -->
+  <div id="app-view" class="hidden">
+    <header>
+      <h1>Suivi de production comptable</h1>
+      <span id="loop-status-badge" class="badge">CGI Loop : vérification…</span>
+      <span id="realtime-badge" class="badge ok">● Temps réel actif</span>
+      <span id="user-badge" class="badge"></span>
+      <button type="button" id="btn-logout">Déconnexion</button>
+    </header>
+
+    <nav id="nav">
+      <button type="button" data-tab="tasks" class="on">Tâches du cabinet</button>
+      <button type="button" data-tab="dossiers">Dossiers CGI Loop</button>
+      <button type="button" data-tab="admin" id="tab-admin-btn">Administration &amp; Audit</button>
+    </nav>
+
+    <main>
+      <div id="global-msg" class="alert hidden"></div>
+
+      <!-- Onglet Tâches -->
+      <section id="tab-tasks">
+        <div class="cards" id="kpi-cards"></div>
+        <div class="wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Tâche</th>
+                <th>Dossier</th>
+                <th>Responsable</th>
+                <th>Échéance</th>
+                <th>Priorité</th>
+                <th>Statut</th>
+                <th>Validateur</th>
+              </tr>
+            </thead>
+            <tbody id="tasks-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Onglet Dossiers & Synchronisation CGI Loop -->
+      <section id="tab-dossiers" class="hidden">
+        <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <div>
+            <strong>Synchronisation des dossiers CGI Loop</strong>
+            <div id="loop-last-sync" style="font-size:12px;color:var(--mu);">Chargement…</div>
+          </div>
+          <button type="button" id="btn-sync-loop" class="pri">↻ Synchroniser maintenant</button>
+        </div>
+        <div class="wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>N° Dossier</th>
+                <th>Raison sociale</th>
+                <th>SIREN</th>
+                <th>Régime TVA</th>
+                <th>Clôture</th>
+                <th>Dernière synchro Loop</th>
+              </tr>
+            </thead>
+            <tbody id="dossiers-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Onglet Administration & Journal d'audit -->
+      <section id="tab-admin" class="hidden">
+        <div class="card">
+          <h3 style="margin-top:0;">Configuration API sécurisée CGI Loop</h3>
+          <form id="loop-cfg-form" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+            <input type="url" id="cfg-url" placeholder="URL API CGI Loop (https://...)" required>
+            <input type="text" id="cfg-tenant" placeholder="Identifiant Tenant Cabinet" required>
+            <input type="text" id="cfg-client-id" placeholder="Client ID OAuth2" required>
+            <input type="password" id="cfg-client-secret" placeholder="Client Secret OAuth2" required>
+            <button type="submit" class="pri">Enregistrer (chiffré AES-256)</button>
+          </form>
+        </div>
+
+        <div class="wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Horodatage</th>
+                <th>Utilisateur</th>
+                <th>Action</th>
+                <th>Entité</th>
+                <th>Détails</th>
+              </tr>
+            </thead>
+            <tbody id="audit-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const STATUS_LABELS = ['Non fait', 'Demande au client', 'En attente', 'En cours', 'Fait', 'Validé'];
+    let currentUser = null;
+    let appData = { users: [], dossiers: [], tasks: [], loopStatus: null };
+    let eventSource = null;
+
+    const $ = (sel) => document.querySelector(sel);
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    async function api(url, options = {}) {
+      const res = await fetch(url, {
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        ...options
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Erreur serveur (${res.status})`);
+      return body;
+    }
+
+    function showError(msg) {
+      const box = $('#global-msg');
+      if (!msg) { box.classList.add('hidden'); return; }
+      box.textContent = msg;
+      box.classList.remove('hidden');
+    }
+
+    async function loadCentralState() {
+      try {
+        showError('');
+        appData = await api('/api/state');
+        renderAll();
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    function connectRealtimeStream() {
+      if (eventSource) eventSource.close();
+      eventSource = new EventSource('/api/stream');
+      eventSource.addEventListener('tasks_changed', loadCentralState);
+      eventSource.addEventListener('dossiers_changed', loadCentralState);
+      eventSource.onerror = () => {
+        $('#realtime-badge').textContent = '● Reconnexion…';
+        $('#realtime-badge').className = 'badge er';
+      };
+      eventSource.onopen = () => {
+        $('#realtime-badge').textContent = '● Temps réel actif';
+        $('#realtime-badge').className = 'badge ok';
+      };
+    }
+
+    function renderAll() {
+      // Statut CGI Loop
+      const ls = appData.loopStatus;
+      const badge = $('#loop-status-badge');
+      if (!ls) {
+        badge.textContent = 'CGI Loop : non configuré';
+        badge.className = 'badge';
+      } else if (ls.last_sync_status === 'ERROR') {
+        badge.textContent = `CGI Loop : Erreur synchro`;
+        badge.className = 'badge er';
+        $('#loop-last-sync').textContent = `Dernière tentative en erreur : ${ls.last_sync_error || ''}`;
+      } else {
+        badge.textContent = 'CGI Loop : Connecté';
+        badge.className = 'badge ok';
+        $('#loop-last-sync').textContent = ls.last_sync_at
+          ? `Dernière synchronisation réussie le ${new Date(ls.last_sync_at).toLocaleString('fr-FR')}`
+          : 'Jamais synchronisé';
+      }
+
+      // KPIs
+      const t = appData.tasks;
+      $('#kpi-cards').innerHTML = `
+        <div class="card"><b>${t.filter(x => x.status === 0).length}</b><span>Non fait</span></div>
+        <div class="card"><b>${t.filter(x => x.status === 3).length}</b><span>En cours</span></div>
+        <div class="card"><b>${t.filter(x => x.status === 4).length}</b><span>À valider</span></div>
+        <div class="card"><b>${t.filter(x => x.status === 5).length}</b><span>Validées</span></div>
+      `;
+
+      // Table des tâches partagées
+      const canValidate = ['ADMIN', 'ASSOCIE', 'CHEF_MISSION'].includes(currentUser.role);
+      $('#tasks-tbody').innerHTML = t.map(task => `
+        <tr>
+          <td>${esc(task.title)} ${task.recurring_template_id ? '🔁' : ''}</td>
+          <td>${esc(task.dos)}</td>
+          <td>${esc(task.resp)}</td>
+          <td>${esc(String(task.due_date).slice(0, 10))}</td>
+          <td>${esc(task.priority)}</td>
+          <td>
+            <select data-task-id="${esc(task.id)}" data-version="${task.version}" class="status-select">
+              ${STATUS_LABELS.map((lbl, idx) => `
+                <option value="${idx}" ${idx === task.status ? 'selected' : ''} ${idx === 5 && !canValidate ? 'disabled' : ''}>
+                  ${lbl}
+                </option>
+              `).join('')}
+            </select>
+          </td>
+          <td>${esc(task.val || '—')}</td>
+        </tr>
+      `).join('');
+
+      document.querySelectorAll('.status-select').forEach(sel => {
+        sel.addEventListener('change', async () => {
+          try {
+            await api(`/api/tasks/${sel.dataset.taskId}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: Number(sel.value), version: Number(sel.dataset.version) })
+            });
+            await loadCentralState();
+          } catch (err) {
+            showError(err.message);
+            await loadCentralState();
+          }
+        });
+      });
+
+      // Table des dossiers
+      $('#dossiers-tbody').innerHTML = appData.dossiers.map(d => `
+        <tr>
+          <td><strong>${esc(d.numero_dossier)}</strong></td>
+          <td>${esc(d.raison_sociale)}</td>
+          <td>${esc(d.siren || '—')}</td>
+          <td>${esc(d.regime_tva || '—')}</td>
+          <td>${esc(d.date_cloture || '—')}</td>
+          <td>${d.synced_at ? new Date(d.synced_at).toLocaleString('fr-FR') : 'Manuel'}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadAuditLogs() {
+      try {
+        const logs = await api('/api/audit-logs');
+        $('#audit-tbody').innerHTML = logs.map(l => `
+          <tr>
+            <td>${new Date(l.occurred_at).toLocaleString('fr-FR')}</td>
+            <td>${esc(l.user_email || 'Système')}</td>
+            <td><strong>${esc(l.action)}</strong></td>
+            <td>${esc(l.entity_type)}</td>
+            <td style="font-family:monospace;font-size:12px;">${esc(JSON.stringify(l.details))}</td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    // Navigation par onglets
+    document.querySelectorAll('#nav button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#nav button').forEach(b => b.classList.remove('on'));
+        btn.classList.add('on');
+        const target = btn.dataset.tab;
+        ['tasks', 'dossiers', 'admin'].forEach(t => $(`#tab-${t}`).classList.toggle('hidden', t !== target));
+        if (target === 'admin') loadAuditLogs();
+      });
+    });
+
+    // Connexion individuelle
+    $('#login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      $('#login-error').classList.add('hidden');
+      try {
+        currentUser = await api('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ email: $('#login-email').value, password: $('#login-password').value })
+        });
+        initAuthenticatedSession();
+      } catch (err) {
+        $('#login-error').textContent = err.message;
+        $('#login-error').classList.remove('hidden');
+      }
+    });
+
+    $('#btn-logout').addEventListener('click', async () => {
+      await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      location.reload();
+    });
+
+    $('#btn-sync-loop').addEventListener('click', async () => {
+      const btn = $('#btn-sync-loop');
+      btn.disabled = true;
+      try {
+        await api('/api/integrations/loop/sync', { method: 'POST' });
+        await loadCentralState();
+      } catch (err) {
+        showError(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $('#loop-cfg-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/integrations/loop/config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            base_url: $('#cfg-url').value,
+            tenant_id: $('#cfg-tenant').value,
+            client_id: $('#cfg-client-id').value,
+            client_secret: $('#cfg-client-secret').value
+          })
+        });
+        alert('Configuration CGI Loop enregistrée et chiffrée avec succès.');
+        await loadCentralState();
+      } catch (err) {
+        showError(err.message);
+      }
+    });
+
+    async function initAuthenticatedSession() {
+      $('#login-view').classList.add('hidden');
+      $('#app-view').classList.remove('hidden');
+      $('#user-badge').textContent = `${currentUser.name} (${currentUser.role})`;
+      if (!['ADMIN', 'ASSOCIE'].includes(currentUser.role)) {
+        $('#tab-admin-btn').classList.add('hidden');
+      }
+      await loadCentralState();
+      connectRealtimeStream();
+    }
+
+    // Restauration de session serveur au chargement
+    (async () => {
+      try {
+        currentUser = await api('/api/me');
+        await initAuthenticatedSession();
+      } catch {
+        $('#login-view').classList.remove('hidden');
+      }
+    })();
+  </script>
+</body>
+</html>
