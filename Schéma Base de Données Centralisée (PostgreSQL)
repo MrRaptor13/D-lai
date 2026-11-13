@@ -1,0 +1,130 @@
+-- ============================================================================
+-- SCHÉMA DE BASE DE DONNÉES CENTRALISÉE - SUIVI DE PRODUCTION CABINET
+-- SGBD : PostgreSQL 15+ (Chiffrement au repos TDE / volume chiffré)
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- 1. Utilisateurs & Rôles (Authentification individuelle et RBAC)
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    full_name VARCHAR(150) NOT NULL,
+    password_hash TEXT NOT NULL, -- Argon2id / Bcrypt
+    role VARCHAR(30) NOT NULL CHECK (role IN ('ADMIN', 'ASSOCIE', 'CHEF_MISSION', 'COLLABORATEUR')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    mfa_secret_enc BYTEA,
+    last_login_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 2. Configuration sécurisée des connecteurs externes (CGI Loop)
+CREATE TABLE integration_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider VARCHAR(50) UNIQUE NOT NULL DEFAULT 'CGI_LOOP',
+    base_url TEXT NOT NULL,
+    client_id_enc BYTEA NOT NULL,     -- Chiffré AES-256-GCM côté serveur
+    client_secret_enc BYTEA NOT NULL, -- Chiffré AES-256-GCM côté serveur
+    tenant_id VARCHAR(100) NOT NULL,
+    last_sync_at TIMESTAMPTZ,
+    last_sync_status VARCHAR(20) CHECK (last_sync_status IN ('OK', 'PARTIAL', 'ERROR')),
+    last_sync_error TEXT,
+    updated_by UUID REFERENCES users(id),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 3. Dossiers clients (Synchronisés depuis CGI Loop ou créés en cabinet)
+CREATE TABLE dossiers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    loop_external_id VARCHAR(100) UNIQUE, -- Identifiant unique CGI Loop
+    numero_dossier VARCHAR(50) UNIQUE NOT NULL,
+    raison_sociale VARCHAR(255) NOT NULL,
+    siren VARCHAR(9),
+    forme_juridique VARCHAR(50),
+    regime_tva VARCHAR(50),
+    date_cloture VARCHAR(10), -- Format MM-DD (ex: 12-31)
+    responsable_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    validateur_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+    synced_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 4. Modèles de tâches récurrentes
+CREATE TABLE recurring_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    dossier_id UUID NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+    responsable_id UUID NOT NULL REFERENCES users(id),
+    validateur_id UUID REFERENCES users(id),
+    priority VARCHAR(20) NOT NULL DEFAULT 'Normale' CHECK (priority IN ('Basse', 'Normale', 'Haute', 'Urgente')),
+    frequency VARCHAR(30) NOT NULL CHECK (frequency IN ('Quotidienne', 'Hebdomadaire', 'Mensuelle', 'Trimestrielle', 'Semestrielle', 'Annuelle', 'Personnalisée')),
+    custom_interval INT DEFAULT 1,
+    custom_unit VARCHAR(5) DEFAULT 'm' CHECK (custom_unit IN ('d', 'm')),
+    day_of_month INT CHECK (day_of_month BETWEEN 1 AND 31),
+    next_due_date DATE NOT NULL,
+    end_date DATE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE recurring_template_associates (
+    template_id UUID REFERENCES recurring_templates(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (template_id, user_id)
+);
+
+-- 5. Tâches de production (Données partagées en temps réel)
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    loop_task_id VARCHAR(100) UNIQUE,
+    title VARCHAR(255) NOT NULL,
+    group_label VARCHAR(255),
+    description TEXT,
+    dossier_id UUID NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+    responsable_id UUID NOT NULL REFERENCES users(id),
+    validateur_id UUID REFERENCES users(id),
+    due_date DATE NOT NULL,
+    priority VARCHAR(20) NOT NULL DEFAULT 'Normale' CHECK (priority IN ('Basse', 'Normale', 'Haute', 'Urgente')),
+    status SMALLINT NOT NULL DEFAULT 0 CHECK (status BETWEEN 0 AND 5),
+    -- 0: Non fait, 1: Demande client, 2: En attente, 3: En cours, 4: Fait, 5: Validé
+    recurring_template_id UUID REFERENCES recurring_templates(id) ON DELETE SET NULL,
+    occurrence_key VARCHAR(120), -- Clé déterministe : "<template_id>_<YYYY-MM-DD>"
+    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+    version INT NOT NULL DEFAULT 1, -- Verrouillage optimiste contre conflits simultanés
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- PRÉVENTION STRICTE DES DOUBLONS AU NIVEAU BASE DE DONNÉES :
+    -- Deux collaborateurs ou deux processus cron ne peuvent jamais générer la même occurrence
+    CONSTRAINT uq_recurring_occurrence UNIQUE (recurring_template_id, occurrence_key)
+);
+
+CREATE TABLE task_associates (
+    task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, user_id)
+);
+
+-- 6. Journalisation immuable des actions (Audit Trail)
+CREATE TABLE audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    user_email VARCHAR(255),
+    action VARCHAR(80) NOT NULL, -- ex: 'AUTH_LOGIN', 'TASK_UPDATE', 'LOOP_SYNC_ERROR', 'RECURRENCE_GEN'
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id VARCHAR(100),
+    ip_address INET,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- Indexation pour performances multi-utilisateurs
+CREATE INDEX idx_tasks_dossier ON tasks(dossier_id);
+CREATE INDEX idx_tasks_responsable ON tasks(responsable_id);
+CREATE INDEX idx_tasks_due_date ON tasks(due_date) WHERE is_archived = FALSE;
+CREATE INDEX idx_audit_logs_occurred ON audit_logs(occurred_at DESC);
